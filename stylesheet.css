@@ -1,0 +1,114 @@
+/* ========== Panel (top bar) ========== */
+
+.tokens-panel-box {
+    spacing: 10px;
+    padding: 0 6px;
+}
+
+.tokens-panel-svc {
+    spacing: 4px;
+}
+
+.tokens-panel-icon {
+    color: -st-fg-color;
+    icon-size: 14px;
+}
+
+.tokens-svc-header-icon {
+    color: -st-fg-color;
+    icon-size: 18px;
+}
+
+.tokens-panel-pct {
+    font-feature-settings: "tnum";
+    font-weight: 600;
+    font-size: 10pt;
+}
+
+.tokens-panel-pct-ok      { color: #8bc34a; }
+.tokens-panel-pct-warn    { color: #ffb74d; }
+.tokens-panel-pct-danger  { color: #ef5350; }
+.tokens-panel-pct-error   { color: #ef5350; }
+
+/* ========== Popup menu ========== */
+
+.tokens-popup-section {
+    padding: 8px 14px;
+    spacing: 8px;
+}
+
+.tokens-svc-header {
+    spacing: 8px;
+}
+
+.tokens-svc-header-name {
+    font-weight: bold;
+    font-size: 11pt;
+}
+
+.tokens-svc-header-meta {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 9pt;
+}
+
+.tokens-window-row {
+    spacing: 3px;
+    padding: 4px 0;
+}
+
+.tokens-window-row-top {
+    spacing: 8px;
+}
+
+.tokens-window-label {
+    font-size: 10pt;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.tokens-window-pct {
+    font-feature-settings: "tnum";
+    font-size: 10pt;
+    font-weight: 600;
+}
+
+.tokens-window-reset {
+    font-size: 9pt;
+    color: rgba(255, 255, 255, 0.55);
+    font-feature-settings: "tnum";
+}
+
+/* progress bar: track + fill */
+
+.tokens-bar-track {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    height: 6px;
+}
+
+.tokens-bar-fill {
+    border-radius: 4px;
+    height: 6px;
+    background-color: #8bc34a;
+}
+
+.tokens-bar-fill-warn   { background-color: #ffb74d; }
+.tokens-bar-fill-danger { background-color: #ef5350; }
+
+/* extra usage and error */
+
+.tokens-extra {
+    font-size: 9pt;
+    color: rgba(255, 255, 255, 0.65);
+    padding-top: 2px;
+}
+
+.tokens-error {
+    color: #ef5350;
+    font-size: 10pt;
+}
+
+.tokens-empty {
+    color: rgba(255, 255, 255, 0.45);
+    font-style: italic;
+    font-size: 10pt;
+}
