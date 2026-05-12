@@ -37,6 +37,8 @@ Response shape (only the fields used):
 
 Cached at `~/.cache/coding-agent-quota/claude_usage.json` with `fetched_at`. TTL is `CLAUDE_TTL_MS` (15 min). `Refresh now` menu item bypasses TTL.
 
+On fetch failure (network error, 429, etc.) the popup falls back to the most recent cached `usage` and shows the error as a small orange `refresh failed: ...` line above the rows. A `429` response sets a module-level `_claudeBackoffUntil` from the `Retry-After` header (default 5 min if absent); subsequent calls before that timestamp skip the API entirely and return cache with a "rate-limited until HH:MM" message instead of hitting the endpoint again.
+
 ### Codex — local session JSONL
 
 Server pushes `rate_limits` inside `event_msg` events of type `token_count` straight into Codex's session log. We do not call any Codex API.
@@ -59,7 +61,7 @@ Shape:
 }
 ```
 
-`used_percent` is stale between Codex turns — reset times are still authoritative.
+`used_percent` is stale between Codex turns — reset times are still authoritative. When the snapshot's `primary.resets_at` is in the past (5-hour window has reset since the snapshot was captured), the popup shows an orange `snapshot stale — run \`codex\` to update` warning. `fmtAge` formats ages over 24h as `Xd Yh` so a 5-day-old snapshot reads `4d 22h` instead of `118h32m`.
 
 ## Build / install
 
@@ -71,6 +73,12 @@ gnome-extensions enable coding-agent-quota@tienipia.github.io   # only needed fi
 
 `--extra-source=icons` is required — default `pack` only bundles `extension.js`, `metadata.json`, `stylesheet.css`, plus `schemas/` and `locale/`.
 
+**DANGER — symlinked install dir:** if `~/.local/share/gnome-shell/extensions/<uuid>/` is currently a symlink to this repo, running `gnome-extensions install --force` will **delete the symlink target's contents** (the repo source files, including `.git/`). Before running install with a symlink in place, either:
+- `rm` the symlink first (`rm ~/.local/share/gnome-shell/extensions/<uuid>`) so install operates on a fresh path, or
+- skip install entirely and edit the repo in-place (the symlink already makes the shell load the repo files).
+
+After install, recreate the symlink with `rm -rf <ext-dir> && ln -s <repo-path> <ext-dir>` for in-place editing.
+
 ## Wayland reload constraint (important)
 
 **GNOME Shell on Wayland cannot fully reload an extension's JS without restarting the shell.** GJS holds the `import()`-loaded module in the SpiderMonkey context for the shell's lifetime. `gnome-extensions disable && enable` only calls lifecycle methods on the same cached module. The D-Bus `ReloadExtension` method exists but responds with "deprecated and does not work". `gnome-extensions install --force` overwrites disk files but does not reload the running module.
@@ -79,7 +87,7 @@ Code changes therefore require **log out → log in** (or full reboot) on Waylan
 
 ## Async I/O contract
 
-All file I/O goes through `Gio._promisify`-wrapped async methods (`load_contents_async`, `replace_contents_async`, `enumerate_children_async`, `next_files_async`). The synchronous variants are forbidden by EGO review (rule EGO-X-004). The Codex JSONL walk uses paged `next_files_async(50, ...)` to avoid holding a huge file-info array.
+All file I/O goes through `Gio._promisify`-wrapped async methods (`load_contents_async`, `replace_contents_async`, `enumerate_children_async`, `next_files_async`, `query_info_async`). The synchronous variants are forbidden by EGO review (rule EGO-X-004). The Codex JSONL walk uses paged `next_files_async(50, ...)` to avoid holding a huge file-info array.
 
 ## Gotchas
 
@@ -93,7 +101,11 @@ All file I/O goes through `Gio._promisify`-wrapped async methods (`load_contents
 
 - **Codex JSONL files can be tens of MB.** Async paged enumeration + per-file async `load_contents_async` keeps the shell main loop responsive. We still `text.split('\n')` whole-file once per session — acceptable for a handful of recent sessions.
 
-- **The local `~/.local/share/gnome-shell/extensions/<uuid>/` may be a symlink to this repo or a real directory** depending on install method. `gnome-extensions install --force` always creates a real directory. To restore the symlink for in-place editing: `rm -rf <ext-dir> && ln -s <repo-path> <ext-dir>` — but symlinked source still needs shell restart to be picked up (same Wayland constraint).
+- **Use `St.BoxLayout` for progress bars, not `St.Bin`.** A fixed-width fill child inside an `St.Bin` renders centered in the track even with `x_align: Clutter.ActorAlign.START` set on the bin — Clutter still reconciles the child's default `x_align: FILL` with `set_width()` by centering the constrained allocation. `St.BoxLayout` (vertical: false) packs the child from the start unambiguously.
+
+- **`Soup.Message.get_status()` throws on unknown HTTP codes.** GJS converts the return value to the `Soup.Status` enum, which only knows a fixed set of codes. A response like `429 Too Many Requests` fails with `"429 is not a valid value for enumeration Status"`. Use the raw `msg.status_code` property (uint) for comparisons and error messages instead.
+
+- **The local `~/.local/share/gnome-shell/extensions/<uuid>/` may be a symlink to this repo or a real directory** depending on install method. `gnome-extensions install --force` always creates a real directory and (see Build/install above) **destroys the symlink target** in the process. To restore the symlink for in-place editing: `rm -rf <ext-dir> && ln -s <repo-path> <ext-dir>` — but symlinked source still needs shell restart to be picked up (same Wayland constraint).
 
 ## Visual structure
 
@@ -101,7 +113,7 @@ Panel widget (top bar):
 ```
 [claude-icon] 17%   [codex-icon] 17%
 ```
-Each pct is the **worst** of (5h, weekly) for that service. Color: green <50%, orange 50-80%, red ≥80%, red `!` on auth error.
+Each pct is the **worst** of (5h, weekly) for that service. Color: green <50%, orange 50-80%, red ≥80%, red `!` on auth error. Services with missing credentials/sessions display `—` (not `!`) and the popup shows "Not configured".
 
 Popup:
 - Per-service header: icon + name + meta (cache age / plan type)

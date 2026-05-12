@@ -112,3 +112,8 @@
     font-style: italic;
     font-size: 10pt;
 }
+
+.tokens-warn {
+    color: #ffb74d;
+    font-size: 9pt;
+}

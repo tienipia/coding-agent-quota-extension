@@ -13,6 +13,7 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 Gio._promisify(Gio.File.prototype, 'load_contents_async');
 Gio._promisify(Gio.File.prototype, 'replace_contents_async');
 Gio._promisify(Gio.File.prototype, 'enumerate_children_async');
+Gio._promisify(Gio.File.prototype, 'query_info_async');
 Gio._promisify(Gio.FileEnumerator.prototype, 'next_files_async');
 
 const REFRESH_SEC = 60;
@@ -27,6 +28,8 @@ const CLAUDE_CACHE_PATH = GLib.build_filenamev([CACHE_DIR, 'claude_usage.json'])
 const BAR_WIDTH = 180;
 const PANEL_ICON_PX = 14;
 const HEADER_ICON_PX = 18;
+
+let _claudeBackoffUntil = 0;
 
 // ---------- async file helpers ----------
 
@@ -90,8 +93,18 @@ function fetchClaudeUsage(token, session) {
         session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, null, (_, res) => {
             try {
                 const bytes = session.send_and_read_finish(res);
-                if (msg.get_status() !== Soup.Status.OK) {
-                    reject(new Error(`HTTP ${msg.get_status()}`));
+                const status = msg.status_code;
+                if (status !== 200) {
+                    const err = new Error(`HTTP ${status}`);
+                    if (status === 429) {
+                        let retryAfter = null;
+                        try {
+                            retryAfter = msg.response_headers?.get_one('Retry-After');
+                        } catch {}
+                        const ms = parseRetryAfter(retryAfter);
+                        err.retryAfterMs = ms != null ? ms : 5 * 60 * 1000;
+                    }
+                    reject(err);
                     return;
                 }
                 const text = new TextDecoder().decode(bytes.get_data());
@@ -104,26 +117,68 @@ function fetchClaudeUsage(token, session) {
 }
 
 async function getClaudeUsage(session, force = false) {
-    if (!force) {
-        const c = await loadClaudeCache();
-        if (c?.usage && Date.now() - c.fetched_at < CLAUDE_TTL_MS) {
-            return { usage: c.usage, fetchedAt: c.fetched_at, fromCache: true };
-        }
+    const cache = await loadClaudeCache();
+    const now = Date.now();
+
+    if (!force && cache?.usage && now - cache.fetched_at < CLAUDE_TTL_MS) {
+        return { usage: cache.usage, fetchedAt: cache.fetched_at, fromCache: true };
     }
+
     const oauth = await loadClaudeOauth();
-    if (!oauth?.accessToken) throw new Error('no claude credentials');
-    if (oauth.expiresAt && Date.now() > oauth.expiresAt) {
+    if (!oauth?.accessToken) return { notConfigured: true };
+    if (oauth.expiresAt && now > oauth.expiresAt) {
         throw new Error('access token expired (run `claude` to refresh)');
     }
-    const usage = await fetchClaudeUsage(oauth.accessToken, session);
-    await saveClaudeCache(usage);
-    return { usage, fetchedAt: Date.now(), fromCache: false };
+
+    if (now < _claudeBackoffUntil) {
+        const msg = `rate-limited until ${fmtTime(new Date(_claudeBackoffUntil))}`;
+        if (cache?.usage) {
+            return {
+                usage: cache.usage,
+                fetchedAt: cache.fetched_at,
+                fromCache: true,
+                fetchError: msg,
+            };
+        }
+        throw new Error(msg);
+    }
+
+    try {
+        const usage = await fetchClaudeUsage(oauth.accessToken, session);
+        await saveClaudeCache(usage);
+        return { usage, fetchedAt: Date.now(), fromCache: false };
+    } catch (e) {
+        if (e.retryAfterMs != null) {
+            _claudeBackoffUntil = Date.now() + e.retryAfterMs;
+        }
+        if (cache?.usage) {
+            return {
+                usage: cache.usage,
+                fetchedAt: cache.fetched_at,
+                fromCache: true,
+                fetchError: e.message ?? String(e),
+            };
+        }
+        throw e;
+    }
 }
 
 // ---------- Codex data ----------
 
 async function readCodexLatest() {
     const root = `${HOME}/.codex/sessions`;
+
+    try {
+        await Gio.File.new_for_path(root).query_info_async(
+            'standard::type',
+            Gio.FileQueryInfoFlags.NONE,
+            GLib.PRIORITY_DEFAULT,
+            null,
+        );
+    } catch {
+        return { notConfigured: true };
+    }
+
     const cutoff = Math.floor(Date.now() / 1000) - 7 * 24 * 3600;
     let bestTs = 0;
     let bestRL = null;
@@ -218,7 +273,18 @@ function fmtTime(d) {
 function fmtAge(ms) {
     if (ms < 60_000) return `${Math.floor(ms / 1000)}s`;
     if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`;
-    return `${Math.floor(ms / 3_600_000)}h${Math.floor((ms % 3_600_000) / 60_000)}m`;
+    if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h${Math.floor((ms % 3_600_000) / 60_000)}m`;
+    return `${Math.floor(ms / 86_400_000)}d ${Math.floor((ms % 86_400_000) / 3_600_000)}h`;
+}
+
+function parseRetryAfter(value) {
+    if (!value) return null;
+    const trimmed = value.trim();
+    const n = parseInt(trimmed, 10);
+    if (!isNaN(n) && String(n) === trimmed) return n * 1000;
+    const date = new Date(trimmed);
+    if (!isNaN(date.getTime())) return Math.max(0, date.getTime() - Date.now());
+    return null;
 }
 
 function severityClass(pct, prefix) {
@@ -234,14 +300,17 @@ function pct(v) {
 // ---------- visual builders (no `this`) ----------
 
 function makeProgressBar(percent) {
-    const track = new St.Bin({ style_class: 'tokens-bar-track' });
+    const track = new St.BoxLayout({
+        vertical: false,
+        style_class: 'tokens-bar-track',
+    });
     track.set_width(BAR_WIDTH);
     const fill = new St.Widget({ style_class: 'tokens-bar-fill' });
     const fillW = Math.max(2, Math.min(BAR_WIDTH, Math.round(BAR_WIDTH * percent / 100)));
     fill.set_width(fillW);
     if (percent >= 80) fill.add_style_class_name('tokens-bar-fill-danger');
     else if (percent >= 50) fill.add_style_class_name('tokens-bar-fill-warn');
-    track.set_child(fill);
+    track.add_child(fill);
     return track;
 }
 
@@ -488,13 +557,18 @@ class QuotaIndicator extends PanelMenu.Button {
         const wrap = new St.BoxLayout({ vertical: true, style_class: 'tokens-popup-section' });
 
         let meta = '';
-        if (data) {
+        if (data?.usage) {
             meta = data.fromCache ? `cached ${fmtAge(Date.now() - data.fetchedAt)}` : 'just now';
         }
         wrap.add_child(makeServiceHeader(
             this._mkIcon('claude', HEADER_ICON_PX, 'tokens-svc-header-icon'),
             'Claude Code', meta));
 
+        if (data?.notConfigured) {
+            wrap.add_child(new St.Label({ text: 'Not configured', style_class: 'tokens-empty' }));
+            addCustomItem(this._claudeSection, wrap);
+            return;
+        }
         if (err) {
             wrap.add_child(new St.Label({ text: err, style_class: 'tokens-error' }));
             addCustomItem(this._claudeSection, wrap);
@@ -504,6 +578,13 @@ class QuotaIndicator extends PanelMenu.Button {
             wrap.add_child(new St.Label({ text: 'no data', style_class: 'tokens-empty' }));
             addCustomItem(this._claudeSection, wrap);
             return;
+        }
+
+        if (data.fetchError) {
+            wrap.add_child(new St.Label({
+                text: `refresh failed: ${data.fetchError}`,
+                style_class: 'tokens-warn',
+            }));
         }
 
         const now = Date.now();
@@ -533,6 +614,15 @@ class QuotaIndicator extends PanelMenu.Button {
         this._codexSection.removeAll();
         const wrap = new St.BoxLayout({ vertical: true, style_class: 'tokens-popup-section' });
 
+        if (codex?.notConfigured) {
+            wrap.add_child(makeServiceHeader(
+                this._mkIcon('codex', HEADER_ICON_PX, 'tokens-svc-header-icon'),
+                'Codex', ''));
+            wrap.add_child(new St.Label({ text: 'Not configured', style_class: 'tokens-empty' }));
+            addCustomItem(this._codexSection, wrap);
+            return;
+        }
+
         if (!codex?.rateLimits) {
             wrap.add_child(makeServiceHeader(
                 this._mkIcon('codex', HEADER_ICON_PX, 'tokens-svc-header-icon'),
@@ -550,6 +640,14 @@ class QuotaIndicator extends PanelMenu.Button {
             'Codex', meta));
 
         const now = Date.now();
+        const primaryResetMs = rl.primary?.resets_at ? rl.primary.resets_at * 1000 : null;
+        if (primaryResetMs && primaryResetMs < now) {
+            wrap.add_child(new St.Label({
+                text: 'snapshot stale — run `codex` to update',
+                style_class: 'tokens-warn',
+            }));
+        }
+
         const rows = [
             [rl.primary,   '5 hours'],
             [rl.secondary, 'Weekly'],
