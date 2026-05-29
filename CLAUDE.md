@@ -6,7 +6,7 @@ GNOME Shell extension that displays Claude Code and Codex (OpenAI) token rate-li
 
 ```
 extension.js          # single-file module: data + UI + lifecycle
-metadata.json         # uuid=coding-agent-quota@tienipia.github.io, shell-version 45-49
+metadata.json         # uuid=coding-agent-quota@tienipia.github.io, shell-version 45-50
 stylesheet.css        # panel + popup theming, progress-bar colors
 icons/
   claude-symbolic.svg # Anthropic asterisk, color baked (coral)
@@ -101,7 +101,9 @@ All file I/O goes through `Gio._promisify`-wrapped async methods (`load_contents
 
 - **Codex JSONL files can be tens of MB.** Async paged enumeration + per-file async `load_contents_async` keeps the shell main loop responsive. We still `text.split('\n')` whole-file once per session — acceptable for a handful of recent sessions.
 
-- **Use `St.BoxLayout` for progress bars, not `St.Bin`.** A fixed-width fill child inside an `St.Bin` renders centered in the track even with `x_align: Clutter.ActorAlign.START` set on the bin — Clutter still reconciles the child's default `x_align: FILL` with `set_width()` by centering the constrained allocation. `St.BoxLayout` (vertical: false) packs the child from the start unambiguously.
+- **Use `St.BoxLayout` for progress bars, not `St.Bin`.** A fixed-width fill child inside an `St.Bin` renders centered in the track even with `x_align: Clutter.ActorAlign.START` set on the bin — Clutter still reconciles the child's default `x_align: FILL` with `set_width()` by centering the constrained allocation. `St.BoxLayout` (`orientation: Clutter.Orientation.HORIZONTAL`) packs the child from the start unambiguously.
+
+- **`St.BoxLayout`'s `vertical: true/false` boolean was removed in GNOME Shell 50.** Use `orientation: Clutter.Orientation.HORIZONTAL` / `VERTICAL`. The shell's own JS migrated entirely — passing `vertical:` on 50 throws at construction. The `orientation` form works on 45+, so it's safe across the full supported range.
 
 - **`Soup.Message.get_status()` throws on unknown HTTP codes.** GJS converts the return value to the `Soup.Status` enum, which only knows a fixed set of codes. A response like `429 Too Many Requests` fails with `"429 is not a valid value for enumeration Status"`. Use the raw `msg.status_code` property (uint) for comparisons and error messages instead.
 

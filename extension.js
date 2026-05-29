@@ -301,7 +301,7 @@ function pct(v) {
 
 function makeProgressBar(percent) {
     const track = new St.BoxLayout({
-        vertical: false,
+        orientation: Clutter.Orientation.HORIZONTAL,
         style_class: 'tokens-bar-track',
     });
     track.set_width(BAR_WIDTH);
@@ -315,9 +315,9 @@ function makeProgressBar(percent) {
 }
 
 function makeWindowRow(label, utilization, resetDate, now) {
-    const row = new St.BoxLayout({ vertical: true, style_class: 'tokens-window-row' });
+    const row = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, style_class: 'tokens-window-row' });
 
-    const top = new St.BoxLayout({ vertical: false, style_class: 'tokens-window-row-top' });
+    const top = new St.BoxLayout({ orientation: Clutter.Orientation.HORIZONTAL, style_class: 'tokens-window-row-top' });
     top.add_child(new St.Label({
         text: label,
         style_class: 'tokens-window-label',
@@ -345,7 +345,7 @@ function makeWindowRow(label, utilization, resetDate, now) {
 }
 
 function makeServiceHeader(iconWidget, name, metaText) {
-    const box = new St.BoxLayout({ vertical: false, style_class: 'tokens-svc-header' });
+    const box = new St.BoxLayout({ orientation: Clutter.Orientation.HORIZONTAL, style_class: 'tokens-svc-header' });
     box.add_child(iconWidget);
     box.add_child(new St.Label({
         text: name,
@@ -383,7 +383,7 @@ class QuotaIndicator extends PanelMenu.Button {
         this._session = new Soup.Session();
 
         this._panelBox = new St.BoxLayout({
-            vertical: false,
+            orientation: Clutter.Orientation.HORIZONTAL,
             style_class: 'tokens-panel-box',
             y_align: Clutter.ActorAlign.CENTER,
         });
@@ -458,7 +458,7 @@ class QuotaIndicator extends PanelMenu.Button {
 
     _mkPanelService(iconName) {
         const box = new St.BoxLayout({
-            vertical: false,
+            orientation: Clutter.Orientation.HORIZONTAL,
             style_class: 'tokens-panel-svc',
             y_align: Clutter.ActorAlign.CENTER,
         });
@@ -554,7 +554,7 @@ class QuotaIndicator extends PanelMenu.Button {
     _renderClaude(data, err) {
         this._claudeSection.removeAll();
 
-        const wrap = new St.BoxLayout({ vertical: true, style_class: 'tokens-popup-section' });
+        const wrap = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, style_class: 'tokens-popup-section' });
 
         let meta = '';
         if (data?.usage) {
@@ -612,7 +612,7 @@ class QuotaIndicator extends PanelMenu.Button {
 
     _renderCodex(codex) {
         this._codexSection.removeAll();
-        const wrap = new St.BoxLayout({ vertical: true, style_class: 'tokens-popup-section' });
+        const wrap = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, style_class: 'tokens-popup-section' });
 
         if (codex?.notConfigured) {
             wrap.add_child(makeServiceHeader(

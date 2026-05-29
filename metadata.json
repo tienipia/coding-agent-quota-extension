@@ -2,7 +2,7 @@
   "uuid": "coding-agent-quota@tienipia.github.io",
   "name": "Coding Agent Quota",
   "description": "Show Claude Code & Codex 5-hour and weekly rate-limit usage in the panel",
-  "shell-version": ["45", "46", "47", "48", "49"],
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": "https://github.com/tienipia/coding-agent-quota-extension",
   "version": 1
 }
