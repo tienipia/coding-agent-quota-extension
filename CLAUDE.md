@@ -11,6 +11,9 @@ stylesheet.css        # panel + popup theming, progress-bar colors
 icons/
   claude-symbolic.svg # Anthropic asterisk, color baked (coral)
   codex-symbolic.svg  # OpenAI blossom, uses currentColor (recolored at runtime)
+tools/
+  usage-probe.js      # gjs -m tools/usage-probe.js — live-probes both usage APIs
+                      # with the extension's exact headers; run after CLI updates
 ```
 
 ## Data sources
@@ -24,57 +27,65 @@ Auth:
 - `anthropic-beta: oauth-2025-04-20`
 - Refresh on token expiry is not implemented; on expired token the indicator shows `!` and the popup explains. User runs `claude` once to refresh credentials manually.
 
-Response shape (only the fields used):
+Response shape (only the fields used; verified against Claude Code 2.1.220, 2026-07):
 ```json
 {
-  "five_hour":        { "utilization": 8.0, "resets_at": "ISO-8601" },
+  "limits": [
+    { "kind": "session",       "group": "session", "percent": 11, "severity": "normal",
+      "resets_at": "ISO-8601", "scope": null, "is_active": true },
+    { "kind": "weekly_all",    "group": "weekly",  "percent": 5,  "resets_at": "ISO-8601", "scope": null },
+    { "kind": "weekly_scoped", "group": "weekly",  "percent": 10, "resets_at": "ISO-8601",
+      "scope": { "model": { "display_name": "Fable" }, "surface": null } }
+  ],
+  "five_hour":        { "utilization": 8.0, "resets_at": "ISO-8601", "limit_dollars": null },
   "seven_day":        { "utilization": 6.0, "resets_at": "ISO-8601" },
-  "seven_day_opus":   null | { ... },
-  "seven_day_sonnet": null | { ... },
+  "seven_day_opus":   null,
+  "seven_day_sonnet": null,
   "extra_usage":      { "is_enabled": true, "used_credits": 0.0, "monthly_limit": 20000.0, "currency": "USD" }
 }
 ```
+
+`_renderClaude` prefers the `limits` array when it has entries with a non-null `percent` — it is authoritative and carries model-scoped weeklies (`weekly_scoped` + `scope.model.display_name`) that never appear as top-level window keys (the legacy `seven_day_opus`/`seven_day_sonnet` keys are now always null). Labels come from `KNOWN_LIMIT_KINDS` (`session` → "5 hours", `weekly_all` → "Weekly", `weekly_scoped` → "Weekly · <scope name>"); unknown kinds render with underscores spaced. `severity`/`is_active` are currently ignored — pct thresholds stay client-side. When `limits` is absent (older cached payloads), the legacy top-level window iteration runs instead. The response also carries a rotating set of experimental null window keys (`tangelo`, `nimbus_quill`, …) — the null-guard skips them.
 
 Cached at `~/.cache/coding-agent-quota/claude_usage.json` with `fetched_at`. TTL is `CLAUDE_TTL_MS` (15 min). `Refresh now` menu item bypasses TTL.
 
 On fetch failure (network error, 429, expired token, etc.) the popup falls back to the most recent cached `usage` and shows the error as a small orange `refresh failed: ...` line above the rows. A `429` response sets a module-level `_claudeBackoffUntil` from the `Retry-After` header (default 5 min if absent); subsequent calls before that timestamp skip the API entirely and return cache with a "rate-limited until HH:MM" message instead of hitting the endpoint again. Expired tokens (per `oauth.expiresAt`) also fall back to cache + "token expired — run `claude` to refresh" rather than blanking the panel.
 
-The header meta shows the plan tier derived from `credentials.json` (`rateLimitTier` like `default_claude_max_20x` → "Max 20x"; falls back to `subscriptionType` like "max" → "Max"). The response carries window keys beyond the known set (`five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `seven_day_oauth_apps`, `seven_day_cowork`, …) — `_renderClaude` iterates all keys with a `utilization` field, so server-side additions surface without code changes. Unknown keys render with their raw snake_case as the label.
+The header meta shows the plan tier derived from `credentials.json` (`rateLimitTier` like `default_claude_max_20x` → "Max 20x"; falls back to `subscriptionType` like "max" → "Max").
 
-### Codex — local session JSONL
+### Codex — `https://chatgpt.com/backend-api/codex/usage`
 
-Server pushes `rate_limits` inside `event_msg` events of type `token_count` straight into Codex's session log. We do not call any Codex API.
+The same backend endpoint the Codex CLI itself queries for `/status`. **Codex ≥ 0.145.0-alpha.27 stopped writing `token_count`/`rate_limits` events into `~/.codex/sessions/**/*.jsonl`** (verified: a rollout written by 0.145.0-alpha.18 carries 535 such events, alpha.27+/0.146 rollouts carry zero, and nothing else under `~/.codex` — sqlite DBs, history.jsonl — has rate-limit data), so the old session-log walk was removed entirely in favor of this API. The API is server-side and works regardless of the installed CLI version.
 
-Walk: `~/.codex/sessions/**/*.jsonl` (only files with mtime within 7d). A module-level `_codexFileCache` (Map keyed by path) stores `{mtime, ts, rateLimits, info}` per file — unchanged files skip re-read entirely. New or modified files are read **tail-first** via `Gio.File.read_async` + `Gio.Seekable.seek` + `Gio.InputStream.read_bytes_async`, trying 64KB then 256KB before falling back to full-file load (`CODEX_TAIL_CHUNKS`). Most `token_count` events live in the last 64KB, so steady-state work is one small tail read per active session instead of hundreds of MB. After the walk, cache entries for paths no longer visible (rolled past 7d, deleted) are GC'd. The newest `token_count` across all files wins.
+Auth (from `~/.codex/auth.json`, maintained by the `codex` CLI):
+- `Authorization: Bearer <tokens.access_token>` — a ~10-day JWT; expiry is pre-checked by decoding the `exp` claim (`jwtExpMs`). On expiry: cache fallback + "token expired — run `codex` to refresh". No refresh flow, same policy as Claude.
+- `chatgpt-account-id: <tokens.account_id>` — optional for personal accounts, selects the workspace on team accounts; sent when present.
+- `User-Agent` — **mandatory**: chatgpt.com sits behind Cloudflare, which 403s UA-less requests. A neutral `coding-agent-quota/0.2` UA is accepted; no need to impersonate the CLI.
+- Missing `tokens.access_token` (not logged in, or API-key-only auth) → "Not configured". API-key mode has no ChatGPT rate-limit windows at all.
 
-Shape:
+Response shape (only the fields used; verified against Codex 0.145.0/0.146.0-alpha, 2026-07):
 ```json
 {
-  "type": "event_msg",
-  "timestamp": "ISO-8601",
-  "payload": {
-    "type": "token_count",
-    "info": {
-      "last_token_usage":     { "total_tokens": 227033, "input_tokens": ..., "cached_input_tokens": ..., "output_tokens": ..., "reasoning_output_tokens": ... },
-      "total_token_usage":    { /* same shape, cumulative across the session */ },
-      "model_context_window": 258400
-    },
-    "rate_limits": {
-      "limit_id":   "codex",
-      "limit_name": null,
-      "primary":    { "used_percent": 17, "window_minutes": 300,   "resets_at": <unix-sec> },
-      "secondary":  { "used_percent": 6,  "window_minutes": 10080, "resets_at": <unix-sec> },
-      "credits":    null,
-      "plan_type":  "prolite",
-      "rate_limit_reached_type": null
-    }
-  }
+  "plan_type": "prolite",
+  "rate_limit": {
+    "limit_reached": false,
+    "primary_window":   { "used_percent": 2, "limit_window_seconds": 604800,
+                          "reset_after_seconds": 351568, "reset_at": <unix-sec> },
+    "secondary_window": null
+  },
+  "additional_rate_limits": [
+    { "limit_name": "GPT-5.3-Codex-Spark", "metered_feature": "codex_bengalfox",
+      "rate_limit": { "primary_window": { ... } } }
+  ],
+  "rate_limit_reached_type": null,
+  "spend_control": { "reached": false },
+  "credits": { "has_credits": false, ... }
 }
 ```
 
-`used_percent` is stale between Codex turns — reset times are still authoritative. When the snapshot's `primary.resets_at` is in the past (5-hour window has reset since the snapshot was captured), the popup shows an orange `snapshot stale — run \`codex\` to update` warning. `rate_limit_reached_type` (when non-null) renders as a second orange warning. `fmtAge` formats ages over 24h as `Xd Yh` so a 5-day-old snapshot reads `4d 22h` instead of `118h32m`.
+**Windows are plan-dependent** — on `prolite` the primary window is weekly (604800 s) and `secondary_window` is null, so row labels derive from `limit_window_seconds` (`codexWindowLabel`: 18000 → "5 hours", 604800 → "Weekly", else humanized), never from primary/secondary position. Reset time prefers absolute `reset_at` (unix sec), falling back to `now + reset_after_seconds`. Each `additional_rate_limits[]` entry renders as an extra row labeled by its `limit_name`. Orange warnings: `rate_limit_reached_type` non-null, `spend_control.reached`.
 
-The `info` block surfaces as two extra popup lines: a `Context · last turn` progress row (`last_token_usage.total_tokens / model_context_window`) and a small grey `Σ N tokens · cache X% · reasoning Y` footer derived from `total_token_usage`.
+Cached at `~/.cache/coding-agent-quota/codex_usage.json`; `CODEX_TTL_MS` (15 min), 429 → `Retry-After` backoff via `_codexBackoffUntil`, network-failure → cache fallback with `refresh failed: ...` — all mirroring the Claude flow (`getCodexUsage` is a deliberate structural mirror of `getClaudeUsage`; keep them in sync when touching either).
 
 ## Build / install
 
@@ -96,11 +107,17 @@ After install, recreate the symlink with `rm -rf <ext-dir> && ln -s <repo-path> 
 
 **GNOME Shell on Wayland cannot fully reload an extension's JS without restarting the shell.** GJS holds the `import()`-loaded module in the SpiderMonkey context for the shell's lifetime. `gnome-extensions disable && enable` only calls lifecycle methods on the same cached module. The D-Bus `ReloadExtension` method exists but responds with "deprecated and does not work". `gnome-extensions install --force` overwrites disk files but does not reload the running module.
 
-Code changes therefore require **log out → log in** (or full reboot) on Wayland. On X11 you can `Alt+F2 → r`. For dev iteration, `dbus-run-session -- gnome-shell --nested --wayland` opens a nested shell that can be killed/reloaded freely without affecting the main session.
+Code changes therefore require **log out → log in** (or full reboot) on Wayland. On X11 you can `Alt+F2 → r`. For dev iteration: **`gnome-shell --nested` was removed in GNOME Shell 50** — use `dbus-run-session -- gnome-shell --devkit` for a windowed dev shell, or a no-window smoke test that still loads/enables the extension and runs a real refresh:
+
+```bash
+timeout 40 dbus-run-session -- gnome-shell --headless --wayland --no-x11 --virtual-monitor 1024x768 2>&1 | grep -iE 'JS ERROR|coding-agent-quota'
+```
+
+(verify success via no JS ERROR lines + fresh mtimes on `~/.cache/coding-agent-quota/*.json`).
 
 ## Async I/O contract
 
-All file I/O goes through `Gio._promisify`-wrapped async methods (`load_contents_async`, `replace_contents_async`, `enumerate_children_async`, `next_files_async`, `query_info_async`, `read_async`, `read_bytes_async`). The synchronous variants are forbidden by EGO review (rule EGO-X-004). The Codex JSONL walk uses paged `next_files_async(50, ...)` to avoid holding a huge file-info array, and tail-reads large session files via `read_async` + `seek` (sync, on the returned `Gio.FileInputStream`) + `read_bytes_async`.
+All file I/O goes through `Gio._promisify`-wrapped async methods (`load_contents_async`, `replace_contents_async`). The synchronous variants are forbidden by EGO review (rule EGO-X-004). Both HTTP fetches share `sendJsonRequest` (Soup `send_and_read_async` → parsed JSON, with 429 `Retry-After` extraction), and the Soup session is constructed with `timeout: HTTP_TIMEOUT_SEC` so a hung connection cannot wedge the `_refreshing` flag forever.
 
 ## Gotchas
 
@@ -112,7 +129,7 @@ All file I/O goes through `Gio._promisify`-wrapped async methods (`load_contents
 
 - **Async setup races with `enable()`.** `_init` is sync (GObject constraint). We kick off `_setupAsync()` fire-and-forget; the panel briefly shows a `…` placeholder until icons preload + first refresh complete. Preload and first refresh are each try/caught so a transient failure still installs the refresh timer — the next 60s tick retries (and `_refresh` also re-tries `_preloadGicons` when `_gicons` is empty), preventing a permanent placeholder.
 
-- **Codex JSONL files can exceed 200MB.** A live session log grew to 212MB in the field; naive `load_contents_async` + `text.split('\n')` per refresh blocked the shell main loop. The walk now caches `(path, mtime) → result`, so unchanged files skip re-read entirely. Modified files are read tail-first (64KB → 256KB → full) so steady-state work for a 200MB active session is one ~64KB read per refresh, not 200MB. `parseTokenCount` runs line-by-line with per-line `try/catch`, so a tail-truncated first line is safely skipped.
+- **chatgpt.com 403s requests without a `User-Agent`.** Cloudflare fronts the Codex usage endpoint; the identical request with any reasonable UA string succeeds. If Codex fetches ever start failing with `HTTP 403`, check the UA header first, not the token.
 
 - **Use `St.BoxLayout` for progress bars, not `St.Bin`.** A fixed-width fill child inside an `St.Bin` renders centered in the track even with `x_align: Clutter.ActorAlign.START` set on the bin — Clutter still reconciles the child's default `x_align: FILL` with `set_width()` by centering the constrained allocation. `St.BoxLayout` (`orientation: Clutter.Orientation.HORIZONTAL`) packs the child from the start unambiguously.
 
@@ -128,13 +145,12 @@ Panel widget (top bar):
 ```
 [claude-icon] 17%   [codex-icon] 17%
 ```
-Each pct is the **worst** of (5h, weekly) for that service. Color: green <50%, orange 50-80%, red ≥80%, red `!` on auth error. Services with missing credentials/sessions display `—` (not `!`) and the popup shows "Not configured".
+Claude pct is the worst of all `limits[]` percents (legacy: worst of 5h/weekly); Codex pct is the worst of `primary_window`/`secondary_window` (model-scoped `additional_rate_limits` excluded from the panel worst-of). Color: green <50%, orange 50-80%, red ≥80%, red `!` on auth/fetch error (both services). Services with missing credentials display `—` (not `!`) and the popup shows "Not configured".
 
 Popup:
-- Per-service header: icon + name + meta. Claude meta = `plan · cache age` (e.g. `Max 20x · cached 5m`); Codex meta = `snapshot age · plan_type` (e.g. `snapshot 12m · prolite`).
-- One row per window: label + pct + horizontal progress bar (fixed `BAR_WIDTH = 180`) + reset timestamp & countdown. Claude iterates the response dynamically so newly-introduced server keys (e.g. `seven_day_cowork`) appear without a code change; the row label comes from `KNOWN_WINDOWS` lookup with the raw key as fallback.
-- Codex adds a `Context · last turn` progress row (no reset stamp) + a `Σ tokens · cache% · reasoning` footer when the server provides the `info` block.
-- Warning lines (orange): `refresh failed: ...` (Claude fallback to cache), `snapshot stale — run \`codex\` to update`, `rate limit reached (...)`.
+- Per-service header: icon + name + meta, both `plan · cache age` (e.g. `Max 20x · cached 5m`, `Prolite · cached 2m`, or `· just now` after a live fetch).
+- One row per window: label + pct + horizontal progress bar (fixed `BAR_WIDTH = 180`) + reset timestamp & countdown. Claude rows come from `limits[]` (fallback: legacy window keys via `KNOWN_WINDOWS`); Codex rows are `primary_window`/`secondary_window` labeled by window length, then one row per `additional_rate_limits[]` entry labeled by `limit_name`.
+- Warning lines (orange, cache-fallback states): `refresh failed: ...`, ``token expired — run `claude`/`codex` to refresh`` (via refresh-failed line), `rate limit reached (...)`, `spend limit reached` (Codex).
 - Severity classes applied to both pct text and bar fill.
 - `Refresh now` action item at bottom.
 

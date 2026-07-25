@@ -16,7 +16,7 @@ GNOME Shell extension that shows your **Claude Code** and **Codex** (OpenAI) tok
 [✦] 17%   [⊛] 17%
 ```
 
-각 서비스 옆 숫자는 **5시간 / 주간** 윈도우 중 더 높은 사용률입니다. 색상은 50% 미만 초록, 50–80% 주황, 80% 이상 빨강. 인증 오류일 땐 `!`.
+각 서비스 옆 숫자는 해당 서비스의 rate-limit 윈도우들 중 **가장 높은 사용률**입니다. 색상은 50% 미만 초록, 50–80% 주황, 80% 이상 빨강. 인증 오류일 땐 `!`.
 
 클릭하면 드롭다운에서 자세히:
 
@@ -30,27 +30,27 @@ GNOME Shell extension that shows your **Claude Code** and **Codex** (OpenAI) tok
   ██████░░░░░░░░░░░░░░
   resets 05-13 11:00 · in 4d 12h
 
-⊛ Codex            snapshot 1m · prolite
-  5 hours                         17.0%
-  ██████████████████░░
-  resets 02:17 · in 3h 40m
+⊛ Codex             Prolite · cached 1m
+  Weekly                           2.0%
+  ██░░░░░░░░░░░░░░░░░░
+  resets 07-29 11:35 · in 4d 2h
   …
   Refresh now
 ```
 
 ### 데이터 출처
 
-- **Claude Code**: Anthropic의 `/api/oauth/usage` 엔드포인트 (Claude Code CLI가 자체적으로 `/usage` 표시할 때 쓰는 그 엔드포인트). **토큰을 소모하지 않습니다.** 응답을 15분 TTL로 로컬 캐시하고 만료 시 재요청.
-- **Codex**: `~/.codex/sessions/**/*.jsonl` 의 가장 최근 `token_count` 이벤트에서 서버가 보낸 `rate_limits` 를 그대로 읽음. 별도 API 호출 없음.
+- **Claude Code**: Anthropic의 `/api/oauth/usage` 엔드포인트 (Claude Code CLI가 자체적으로 `/usage` 표시할 때 쓰는 그 엔드포인트). **토큰을 소모하지 않습니다.** 응답의 `limits` 배열(모델별 주간 한도 포함)을 우선 렌더링.
+- **Codex**: `https://chatgpt.com/backend-api/codex/usage` 엔드포인트 (Codex CLI의 `/status`가 쓰는 그 엔드포인트). 인증은 `~/.codex/auth.json` 의 ChatGPT OAuth 토큰. Codex 0.145 이후 세션 JSONL에 rate limit 이벤트가 더 이상 기록되지 않아 API 방식으로 전환.
 
-`resets_at` 시각은 모두 서버가 직접 내려준 절대 시간이라 정확합니다.
+두 응답 모두 15분 TTL로 로컬 캐시하고 만료 시 재요청. `resets_at` 시각은 모두 서버가 직접 내려준 절대 시간이라 정확합니다. 윈도우 구성은 플랜에 따라 다릅니다 (예: 일부 Codex 플랜은 주간 한도만 존재).
 
 ### 요구사항
 
-- GNOME Shell 45 ~ 49 (ESM imports, `Extension` 베이스 클래스)
+- GNOME Shell 45 ~ 50 (ESM imports, `Extension` 베이스 클래스)
 - libsoup 3
 - `~/.claude/.credentials.json` 의 OAuth 액세스 토큰 (Claude Code 한 번이라도 로그인되어 있으면 됨)
-- Codex 사용량을 보려면 Codex CLI를 한 번이라도 실행해서 세션 JSONL이 있어야 함
+- Codex 사용량을 보려면 Codex CLI가 ChatGPT 계정으로 로그인되어 있어야 함 (`~/.codex/auth.json`)
 
 ### 설치
 
@@ -90,11 +90,11 @@ GNOME Shell on Wayland는 보안상 **동작 중인 셸의 JS 모듈을 다시 �
 
 - 로그아웃 → 로그인 (가장 빠름)
 - 또는 X11 세션에서 `Alt + F2 → r`
-- 또는 개발 중이라면 `dbus-run-session -- gnome-shell --nested --wayland` 로 별도 창 띄우기
+- 또는 개발 중이라면 `dbus-run-session -- gnome-shell --devkit` 로 별도 창 띄우기 (GNOME 50에서 `--nested` 옵션은 제거됨)
 
-### Anthropic API 토큰 만료
+### 토큰 만료
 
-`~/.claude/.credentials.json` 의 OAuth 토큰이 만료되면 패널에 `!` 가 뜹니다. 터미널에서 `claude` 한 번 실행하면 자동 갱신됩니다 (확장은 자동 refresh 안 함).
+OAuth 토큰이 만료되면 패널에 `!` 가 뜹니다. 터미널에서 `claude` 또는 `codex` 를 한 번 실행하면 각 CLI가 자동 갱신합니다 (확장은 자동 refresh 안 함). 캐시가 남아 있으면 만료 안내와 함께 마지막 데이터를 계속 보여줍니다.
 
 ### 라이선스 / 로고
 
@@ -112,23 +112,23 @@ Top panel:
 [✦] 17%   [⊛] 17%
 ```
 
-The number next to each service is the **worse of the 5-hour and weekly utilization**. Color is green under 50%, orange 50–80%, red 80%+. `!` shown on auth error.
+The number next to each service is the **worst utilization across that service's rate-limit windows**. Color is green under 50%, orange 50–80%, red 80%+. `!` shown on auth error.
 
 Click for the full breakdown — see ASCII mock above. Each window row shows the utilization bar, exact reset timestamp, and countdown to reset.
 
 ### Where the data comes from
 
-- **Claude Code**: Anthropic's `/api/oauth/usage` endpoint — the same one Claude Code's `/usage` view uses internally. **Does not consume tokens.** Cached locally with a 15-minute TTL; auto-refetched after expiry.
-- **Codex**: the most recent `token_count` event in `~/.codex/sessions/**/*.jsonl`, where the server-pushed `rate_limits` block lives. No separate API call.
+- **Claude Code**: Anthropic's `/api/oauth/usage` endpoint — the same one Claude Code's `/usage` view uses internally. **Does not consume tokens.** The response's `limits` array (including per-model weekly caps) is rendered preferentially.
+- **Codex**: the `https://chatgpt.com/backend-api/codex/usage` endpoint — the same one the Codex CLI's `/status` uses — authenticated with the ChatGPT OAuth token from `~/.codex/auth.json`. Codex ≥ 0.145 no longer logs rate-limit events into session JSONL files, so the extension switched to the API.
 
-All `resets_at` values are absolute timestamps from the upstream server, so they're accurate.
+Both responses are cached locally with a 15-minute TTL and refetched after expiry. All `resets_at` values are absolute timestamps from the upstream server, so they're accurate. Window sets are plan-dependent (some Codex plans have only a weekly window).
 
 ### Requirements
 
-- GNOME Shell 45 – 49 (ESM imports, `Extension` base class)
+- GNOME Shell 45 – 50 (ESM imports, `Extension` base class)
 - libsoup 3
 - An OAuth access token in `~/.claude/.credentials.json` (logging into Claude Code once is enough)
-- For Codex usage, the Codex CLI must have been run at least once so that session JSONLs exist
+- For Codex usage, the Codex CLI must be logged in with a ChatGPT account (`~/.codex/auth.json`)
 
 ### Install
 
@@ -168,11 +168,11 @@ GNOME Shell on Wayland **cannot reload an extension's JS while running** — the
 
 - log out → log in (fastest)
 - X11 session: `Alt + F2 → r`
-- For iterative dev, run a nested shell in its own window: `dbus-run-session -- gnome-shell --nested --wayland`
+- For iterative dev, run a dev shell in its own window: `dbus-run-session -- gnome-shell --devkit` (the `--nested` option was removed in GNOME 50)
 
-### Anthropic token expiry
+### Token expiry
 
-When the OAuth token in `~/.claude/.credentials.json` expires, the panel shows `!`. Run `claude` once in a terminal to refresh — the extension does not auto-refresh credentials.
+When an OAuth token expires, the panel shows `!` for that service. Run `claude` or `codex` once in a terminal — each CLI refreshes its own credentials; the extension does not. While a cache exists, the last known data keeps rendering alongside the expiry notice.
 
 ### License & marks
 

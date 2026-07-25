@@ -12,28 +12,25 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 Gio._promisify(Gio.File.prototype, 'load_contents_async');
 Gio._promisify(Gio.File.prototype, 'replace_contents_async');
-Gio._promisify(Gio.File.prototype, 'enumerate_children_async');
-Gio._promisify(Gio.File.prototype, 'query_info_async');
-Gio._promisify(Gio.File.prototype, 'read_async');
-Gio._promisify(Gio.FileEnumerator.prototype, 'next_files_async');
-Gio._promisify(Gio.InputStream.prototype, 'read_bytes_async');
 
 const REFRESH_SEC = 60;
 const CLAUDE_TTL_MS = 15 * 60 * 1000;
-const CODEX_MAX_AGE_SEC = 7 * 24 * 3600;
-const CODEX_TAIL_CHUNKS = [64 * 1024, 256 * 1024];
+const CODEX_TTL_MS = 15 * 60 * 1000;
+const HTTP_TIMEOUT_SEC = 15;
 
 const HOME = GLib.get_home_dir();
 const CACHE_DIR = GLib.build_filenamev([
     GLib.get_user_cache_dir(), 'coding-agent-quota',
 ]);
 const CLAUDE_CACHE_PATH = GLib.build_filenamev([CACHE_DIR, 'claude_usage.json']);
+const CODEX_CACHE_PATH = GLib.build_filenamev([CACHE_DIR, 'codex_usage.json']);
 
 const BAR_WIDTH = 180;
 const PANEL_ICON_PX = 14;
 const HEADER_ICON_PX = 18;
 
-// key → display label; unknown keys fall through to the raw key so new
+// Legacy top-level window keys (responses without a `limits` array, e.g. old
+// cached payloads). Unknown keys fall through to the raw key so new
 // server-side windows still surface (extension.js never crashes on them).
 const KNOWN_WINDOWS = {
     five_hour:            '5 hours',
@@ -44,9 +41,15 @@ const KNOWN_WINDOWS = {
     seven_day_cowork:     'Weekly · Cowork',
 };
 
+// `limits[].kind` → display label; scoped limits get their scope name appended.
+const KNOWN_LIMIT_KINDS = {
+    session:       '5 hours',
+    weekly_all:    'Weekly',
+    weekly_scoped: 'Weekly',
+};
+
 let _claudeBackoffUntil = 0;
-// path → {mtime, ts, rateLimits, info}. mtime-keyed so unchanged files skip re-read.
-const _codexFileCache = new Map();
+let _codexBackoffUntil = 0;
 
 // ---------- async file helpers ----------
 
@@ -71,20 +74,8 @@ async function writeText(path, text) {
     }
 }
 
-// ---------- Claude Code data ----------
-
-async function loadClaudeOauth() {
-    const text = await readText(`${HOME}/.claude/.credentials.json`);
-    if (!text) return null;
-    try {
-        return JSON.parse(text).claudeAiOauth ?? null;
-    } catch {
-        return null;
-    }
-}
-
-async function loadClaudeCache() {
-    const text = await readText(CLAUDE_CACHE_PATH);
+async function loadJson(path) {
+    const text = await readText(path);
     if (!text) return null;
     try {
         return JSON.parse(text);
@@ -93,20 +84,14 @@ async function loadClaudeCache() {
     }
 }
 
-async function saveClaudeCache(usage) {
-    await writeText(CLAUDE_CACHE_PATH, JSON.stringify({
-        fetched_at: Date.now(), usage,
-    }));
+function saveUsageCache(path, usage) {
+    return writeText(path, JSON.stringify({ fetched_at: Date.now(), usage }));
 }
 
-function fetchClaudeUsage(token, session) {
+// Shared Soup response handler: resolves parsed JSON on 200, rejects with an
+// Error otherwise; 429 responses carry `retryAfterMs` for backoff handling.
+function sendJsonRequest(session, msg) {
     return new Promise((resolve, reject) => {
-        const msg = Soup.Message.new('GET', 'https://api.anthropic.com/api/oauth/usage');
-        msg.request_headers.append('Authorization', `Bearer ${token}`);
-        msg.request_headers.append('anthropic-beta', 'oauth-2025-04-20');
-        msg.request_headers.append('Content-Type', 'application/json');
-        msg.request_headers.append('User-Agent', 'coding-agent-quota/0.1');
-
         session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, null, (_, res) => {
             try {
                 const bytes = session.send_and_read_finish(res);
@@ -133,8 +118,23 @@ function fetchClaudeUsage(token, session) {
     });
 }
 
+// ---------- Claude Code data ----------
+
+async function loadClaudeOauth() {
+    return (await loadJson(`${HOME}/.claude/.credentials.json`))?.claudeAiOauth ?? null;
+}
+
+function fetchClaudeUsage(token, session) {
+    const msg = Soup.Message.new('GET', 'https://api.anthropic.com/api/oauth/usage');
+    msg.request_headers.append('Authorization', `Bearer ${token}`);
+    msg.request_headers.append('anthropic-beta', 'oauth-2025-04-20');
+    msg.request_headers.append('Content-Type', 'application/json');
+    msg.request_headers.append('User-Agent', 'coding-agent-quota/0.2');
+    return sendJsonRequest(session, msg);
+}
+
 async function getClaudeUsage(session, force = false) {
-    const cache = await loadClaudeCache();
+    const cache = await loadJson(CLAUDE_CACHE_PATH);
     const now = Date.now();
     const oauth = await loadClaudeOauth();
 
@@ -165,7 +165,7 @@ async function getClaudeUsage(session, force = false) {
 
     try {
         const usage = await fetchClaudeUsage(oauth.accessToken, session);
-        await saveClaudeCache(usage);
+        await saveUsageCache(CLAUDE_CACHE_PATH, usage);
         return { usage, fetchedAt: Date.now(), fromCache: false, oauth };
     } catch (e) {
         if (e.retryAfterMs != null) {
@@ -179,148 +179,89 @@ async function getClaudeUsage(session, force = false) {
 
 // ---------- Codex data ----------
 
-async function readFileTail(path, totalSize, chunkBytes) {
-    if (chunkBytes >= totalSize) {
-        return await readText(path);
-    }
-    let stream = null;
+// Codex ≥ 0.145 no longer logs `token_count`/`rate_limits` events into session
+// JSONL files; usage now comes from the same backend endpoint the CLI itself
+// queries. Auth is the ChatGPT OAuth token that `codex` maintains in auth.json.
+
+// JWT payloads are base64url without padding; GLib.base64_decode wants
+// standard base64. Returns the `exp` claim in ms, or null if undecodable.
+function jwtExpMs(token) {
     try {
-        const file = Gio.File.new_for_path(path);
-        stream = await file.read_async(GLib.PRIORITY_DEFAULT, null);
-        stream.seek(totalSize - chunkBytes, GLib.SeekType.SET, null);
-        const bytes = await stream.read_bytes_async(chunkBytes, GLib.PRIORITY_DEFAULT, null);
-        return new TextDecoder().decode(bytes.toArray());
+        const part = token.split('.')[1];
+        const b64 = part.replace(/-/g, '+').replace(/_/g, '/')
+            .padEnd(part.length + (4 - part.length % 4) % 4, '=');
+        const claims = JSON.parse(new TextDecoder().decode(GLib.base64_decode(b64)));
+        return typeof claims.exp === 'number' ? claims.exp * 1000 : null;
     } catch {
         return null;
-    } finally {
-        try { stream?.close(null); } catch {}
     }
 }
 
-function parseTokenCount(text) {
-    // tail-read may have truncated the first line; line-by-line JSON.parse
-    // skips it via the catch block, so partial reads stay safe.
-    const lines = text.split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i];
-        if (!line || !line.includes('"token_count"')) continue;
-        try {
-            const j = JSON.parse(line);
-            if (j.type !== 'event_msg' ||
-                j.payload?.type !== 'token_count' ||
-                !j.payload.rate_limits) continue;
-            return {
-                ts: Math.floor(Date.parse(j.timestamp) / 1000),
-                rateLimits: j.payload.rate_limits,
-                info: j.payload.info ?? null,
-            };
-        } catch {}
-    }
-    return null;
+// null when Codex is not logged in via ChatGPT (missing file or API-key-only
+// auth) — there are no rate-limit windows to show in that mode.
+async function loadCodexAuth() {
+    const tokens = (await loadJson(`${HOME}/.codex/auth.json`))?.tokens;
+    if (!tokens?.access_token) return null;
+    return {
+        accessToken: tokens.access_token,
+        accountId: tokens.account_id ?? null,
+        expiresAt: jwtExpMs(tokens.access_token),
+    };
 }
 
-async function scanCodexFile(path, size) {
-    for (const chunk of CODEX_TAIL_CHUNKS) {
-        if (chunk >= size) break;
-        const text = await readFileTail(path, size, chunk);
-        if (!text) continue;
-        const result = parseTokenCount(text);
-        if (result) return result;
-    }
-    const text = await readText(path);
-    if (!text) return null;
-    return parseTokenCount(text);
+function fetchCodexUsage(auth, session) {
+    const msg = Soup.Message.new('GET', 'https://chatgpt.com/backend-api/codex/usage');
+    msg.request_headers.append('Authorization', `Bearer ${auth.accessToken}`);
+    if (auth.accountId)
+        msg.request_headers.append('chatgpt-account-id', auth.accountId);
+    // chatgpt.com sits behind Cloudflare, which 403s requests without a UA.
+    msg.request_headers.append('User-Agent', 'coding-agent-quota/0.2');
+    msg.request_headers.append('Accept', 'application/json');
+    return sendJsonRequest(session, msg);
 }
 
-async function getOrScanCodexFile(path, mtime, size) {
-    const cached = _codexFileCache.get(path);
-    if (cached && cached.mtime === mtime) {
-        return cached.ts > 0 ? cached : null;
-    }
-    const result = await scanCodexFile(path, size);
-    if (result) {
-        const entry = { mtime, ...result };
-        _codexFileCache.set(path, entry);
-        return entry;
-    }
-    // Remember the (path, mtime) miss so we don't re-scan an unchanged
-    // file that has no token_count event. Re-tried only on mtime change.
-    _codexFileCache.set(path, { mtime, ts: 0, rateLimits: null, info: null });
-    return null;
-}
+async function getCodexUsage(session, force = false) {
+    const cache = await loadJson(CODEX_CACHE_PATH);
+    const now = Date.now();
 
-async function readCodexLatest() {
-    const root = `${HOME}/.codex/sessions`;
+    const cacheHit = msg => cache?.usage ? {
+        usage: cache.usage, fetchedAt: cache.fetched_at,
+        fromCache: true, ...(msg ? { fetchError: msg } : {}),
+    } : null;
+
+    if (!force && cache?.usage && now - cache.fetched_at < CODEX_TTL_MS) {
+        return cacheHit(null);
+    }
+
+    const auth = await loadCodexAuth();
+    if (!auth) return { notConfigured: true };
+
+    if (auth.expiresAt && now > auth.expiresAt) {
+        const msg = 'token expired — run `codex` to refresh';
+        const hit = cacheHit(msg);
+        if (hit) return hit;
+        throw new Error(msg);
+    }
+
+    if (now < _codexBackoffUntil) {
+        const msg = `rate-limited until ${fmtTime(new Date(_codexBackoffUntil))}`;
+        const hit = cacheHit(msg);
+        if (hit) return hit;
+        throw new Error(msg);
+    }
 
     try {
-        await Gio.File.new_for_path(root).query_info_async(
-            'standard::type',
-            Gio.FileQueryInfoFlags.NONE,
-            GLib.PRIORITY_DEFAULT,
-            null,
-        );
-    } catch {
-        return { notConfigured: true };
-    }
-
-    const cutoff = Math.floor(Date.now() / 1000) - CODEX_MAX_AGE_SEC;
-    const seen = new Set();
-    let best = null;
-
-    async function walk(dir) {
-        let enumerator;
-        try {
-            const f = Gio.File.new_for_path(dir);
-            enumerator = await f.enumerate_children_async(
-                'standard::name,standard::type,standard::size,time::modified',
-                Gio.FileQueryInfoFlags.NONE,
-                GLib.PRIORITY_DEFAULT,
-                null,
-            );
-        } catch {
-            return;
+        const usage = await fetchCodexUsage(auth, session);
+        await saveUsageCache(CODEX_CACHE_PATH, usage);
+        return { usage, fetchedAt: Date.now(), fromCache: false };
+    } catch (e) {
+        if (e.retryAfterMs != null) {
+            _codexBackoffUntil = Date.now() + e.retryAfterMs;
         }
-        try {
-            while (true) {
-                let infos;
-                try {
-                    infos = await enumerator.next_files_async(50, GLib.PRIORITY_DEFAULT, null);
-                } catch {
-                    break;
-                }
-                if (!infos || infos.length === 0) break;
-                for (const info of infos) {
-                    const name = info.get_name();
-                    const child = `${dir}/${name}`;
-                    if (info.get_file_type() === Gio.FileType.DIRECTORY) {
-                        await walk(child);
-                    } else if (name.endsWith('.jsonl')) {
-                        const mtime = info.get_modification_date_time()?.to_unix() ?? 0;
-                        if (mtime < cutoff) continue;
-                        seen.add(child);
-                        const size = info.get_size();
-                        const entry = await getOrScanCodexFile(child, mtime, size);
-                        if (entry && (!best || entry.ts > best.ts)) {
-                            best = entry;
-                        }
-                    }
-                }
-            }
-        } finally {
-            try { enumerator.close(null); } catch {}
-        }
+        const hit = cacheHit(e.message ?? String(e));
+        if (hit) return hit;
+        throw e;
     }
-
-    await walk(root);
-
-    // GC: drop cache entries for files no longer visible (rolled past 7d or deleted).
-    for (const path of [..._codexFileCache.keys()]) {
-        if (!seen.has(path)) _codexFileCache.delete(path);
-    }
-
-    return best
-        ? { rateLimits: best.rateLimits, info: best.info, timestamp: best.ts }
-        : null;
 }
 
 // ---------- formatters ----------
@@ -376,6 +317,39 @@ function windowLabel(key) {
     return KNOWN_WINDOWS[key] ?? key.replace(/_/g, ' ');
 }
 
+function claudeLimitLabel(limit) {
+    let label = KNOWN_LIMIT_KINDS[limit.kind] ??
+        (limit.kind ? limit.kind.replace(/_/g, ' ') : 'limit');
+    const scope = limit.scope?.model?.display_name ?? limit.scope?.surface;
+    if (scope) label += ` · ${scope}`;
+    else if (limit.kind === 'weekly_scoped') label += ' · model';
+    return label;
+}
+
+// Codex windows are plan-dependent (e.g. prolite has a weekly primary and no
+// secondary), so the label derives from the window length, not its position.
+function codexWindowLabel(w) {
+    const secs = w.limit_window_seconds ?? 0;
+    if (secs === 5 * 3600) return '5 hours';
+    if (secs === 7 * 24 * 3600) return 'Weekly';
+    if (secs > 0) {
+        const h = Math.round(secs / 3600);
+        return h < 48 ? `${h} hours` : `${Math.round(h / 24)} days`;
+    }
+    return 'Usage';
+}
+
+function codexResetDate(w, nowMs) {
+    if (w.reset_at) return new Date(w.reset_at * 1000);
+    if (w.reset_after_seconds != null) return new Date(nowMs + w.reset_after_seconds * 1000);
+    return null;
+}
+
+function fmtCodexPlan(planType) {
+    if (!planType) return '';
+    return planType[0].toUpperCase() + planType.slice(1);
+}
+
 function fmtPlan(oauth) {
     if (!oauth) return '';
     // rateLimitTier examples: "default_claude_max_20x", "claude_pro"
@@ -387,14 +361,6 @@ function fmtPlan(oauth) {
     const sub = oauth.subscriptionType;
     if (sub) return sub[0].toUpperCase() + sub.slice(1);
     return '';
-}
-
-function fmtTokens(n) {
-    if (n == null) return '?';
-    if (n < 1_000) return String(n);
-    if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}K`;
-    if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    return `${(n / 1_000_000_000).toFixed(2)}B`;
 }
 
 // ---------- visual builders (no `this`) ----------
@@ -480,7 +446,9 @@ class QuotaIndicator extends PanelMenu.Button {
         this._destroyed = false;
         this._refreshing = false;
         this._gicons = new Map();
-        this._session = new Soup.Session();
+        // Without a timeout a single hung connection would wedge `_refreshing`
+        // forever and permanently freeze the panel.
+        this._session = new Soup.Session({ timeout: HTTP_TIMEOUT_SEC });
 
         this._panelBox = new St.BoxLayout({
             orientation: Clutter.Orientation.HORIZONTAL,
@@ -633,40 +601,47 @@ class QuotaIndicator extends PanelMenu.Button {
                 if (this._destroyed) return;
             }
 
-            let claudeData = null, claudeErr = null;
-            try {
-                claudeData = await getClaudeUsage(this._session, force);
-            } catch (e) {
-                claudeErr = e.message ?? String(e);
-            }
+            const [claudeRes, codexRes] = await Promise.allSettled([
+                getClaudeUsage(this._session, force),
+                getCodexUsage(this._session, force),
+            ]);
             if (this._destroyed) return;
 
-            let codex = null;
-            try { codex = await readCodexLatest(); } catch {}
-            if (this._destroyed) return;
+            const claudeData = claudeRes.status === 'fulfilled' ? claudeRes.value : null;
+            const claudeErr = claudeRes.status === 'rejected'
+                ? (claudeRes.reason?.message ?? String(claudeRes.reason)) : null;
+            const codexData = codexRes.status === 'fulfilled' ? codexRes.value : null;
+            const codexErr = codexRes.status === 'rejected'
+                ? (codexRes.reason?.message ?? String(codexRes.reason)) : null;
 
-            this._renderPanel(claudeData?.usage, codex?.rateLimits, claudeErr);
+            this._renderPanel(claudeData?.usage, codexData?.usage, claudeErr, codexErr);
             this._renderClaude(claudeData, claudeErr);
-            this._renderCodex(codex);
+            this._renderCodex(codexData, codexErr);
         } finally {
             this._refreshing = false;
         }
     }
 
-    _renderPanel(claude, codexRL, claudeErr) {
+    _renderPanel(claude, codexUsage, claudeErr, codexErr) {
         if (!this._claudePanel || !this._codexPanel) return;
         const worst = (...vals) => {
             const xs = vals.filter(v => v != null);
             return xs.length ? Math.max(...xs) : null;
         };
-        const cc = claude
-            ? worst(claude.five_hour?.utilization, claude.seven_day?.utilization)
-            : null;
-        const cx = codexRL
-            ? worst(codexRL.primary?.used_percent, codexRL.secondary?.used_percent)
+        let cc = null;
+        if (claude) {
+            const limitPcts = Array.isArray(claude.limits)
+                ? claude.limits.map(l => l?.percent) : [];
+            cc = limitPcts.some(v => v != null)
+                ? worst(...limitPcts)
+                : worst(claude.five_hour?.utilization, claude.seven_day?.utilization);
+        }
+        const rl = codexUsage?.rate_limit;
+        const cx = rl
+            ? worst(rl.primary_window?.used_percent, rl.secondary_window?.used_percent)
             : null;
         this._setPanelPct(this._claudePanel, cc, !!claudeErr);
-        this._setPanelPct(this._codexPanel, cx, false);
+        this._setPanelPct(this._codexPanel, cx, !!codexErr);
     }
 
     _renderClaude(data, err) {
@@ -710,22 +685,34 @@ class QuotaIndicator extends PanelMenu.Button {
         }
 
         const now = Date.now();
-        // Iterate known keys first (stable order), then any newly-introduced
-        // window keys discovered in the response so server-side additions
-        // surface without a code change.
-        const known = Object.keys(KNOWN_WINDOWS);
-        const usageKeys = Object.keys(data.usage);
-        const extras = usageKeys.filter(k =>
-            !known.includes(k) && k !== 'extra_usage' &&
-            data.usage[k] && typeof data.usage[k] === 'object' &&
-            'utilization' in data.usage[k]
-        ).sort();
+        const limits = Array.isArray(data.usage.limits)
+            ? data.usage.limits.filter(l => l && l.percent != null)
+            : [];
+        if (limits.length) {
+            // Current responses carry an authoritative `limits` array, including
+            // model-scoped weeklies that never appear as top-level window keys.
+            for (const l of limits) {
+                const reset = l.resets_at ? new Date(l.resets_at) : null;
+                wrap.add_child(makeWindowRow(claudeLimitLabel(l), l.percent, reset, now));
+            }
+        } else {
+            // Legacy fallback (older cached payloads): iterate known keys first
+            // (stable order), then any newly-introduced window keys discovered
+            // in the response so server-side additions surface without a code change.
+            const known = Object.keys(KNOWN_WINDOWS);
+            const usageKeys = Object.keys(data.usage);
+            const extras = usageKeys.filter(k =>
+                !known.includes(k) && k !== 'extra_usage' &&
+                data.usage[k] && typeof data.usage[k] === 'object' &&
+                'utilization' in data.usage[k]
+            ).sort();
 
-        for (const key of [...known, ...extras]) {
-            const w = data.usage[key];
-            if (!w || typeof w !== 'object' || w.utilization == null) continue;
-            const reset = w.resets_at ? new Date(w.resets_at) : null;
-            wrap.add_child(makeWindowRow(windowLabel(key), w.utilization, reset, now));
+            for (const key of [...known, ...extras]) {
+                const w = data.usage[key];
+                if (!w || typeof w !== 'object' || w.utilization == null) continue;
+                const reset = w.resets_at ? new Date(w.resets_at) : null;
+                wrap.add_child(makeWindowRow(windowLabel(key), w.utilization, reset, now));
+            }
         }
 
         const e = data.usage.extra_usage;
@@ -748,87 +735,82 @@ class QuotaIndicator extends PanelMenu.Button {
         addCustomItem(this._claudeSection, wrap);
     }
 
-    _renderCodex(codex) {
+    _renderCodex(data, err) {
         this._codexSection.removeAll();
         const wrap = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, style_class: 'tokens-popup-section' });
 
-        const header = meta => wrap.add_child(makeServiceHeader(
+        const usage = data?.usage;
+        const metaParts = [];
+        const plan = fmtCodexPlan(usage?.plan_type);
+        if (plan) metaParts.push(plan);
+        if (usage) {
+            metaParts.push(data.fromCache
+                ? `cached ${fmtAge(Date.now() - data.fetchedAt)}`
+                : 'just now');
+        }
+        wrap.add_child(makeServiceHeader(
             this._mkIcon('codex', HEADER_ICON_PX, 'tokens-svc-header-icon'),
-            'Codex', meta));
+            'Codex', metaParts.join(' · ')));
 
-        if (codex?.notConfigured) {
-            header('');
+        if (data?.notConfigured) {
             wrap.add_child(new St.Label({ text: 'Not configured', style_class: 'tokens-empty' }));
             addCustomItem(this._codexSection, wrap);
             return;
         }
-
-        if (!codex?.rateLimits) {
-            header('');
+        if (err) {
+            wrap.add_child(new St.Label({ text: err, style_class: 'tokens-error' }));
+            addCustomItem(this._codexSection, wrap);
+            return;
+        }
+        if (!usage) {
             wrap.add_child(new St.Label({ text: 'no data', style_class: 'tokens-empty' }));
             addCustomItem(this._codexSection, wrap);
             return;
         }
 
-        const rl = codex.rateLimits;
-        const meta = `snapshot ${fmtAge(Date.now() - codex.timestamp * 1000)}` +
-            (rl.plan_type ? ` · ${rl.plan_type}` : '');
-        header(meta);
+        if (data.fetchError) {
+            wrap.add_child(new St.Label({
+                text: `refresh failed: ${data.fetchError}`,
+                style_class: 'tokens-warn',
+            }));
+        }
+        if (usage.rate_limit_reached_type) {
+            wrap.add_child(new St.Label({
+                text: `rate limit reached (${usage.rate_limit_reached_type})`,
+                style_class: 'tokens-warn',
+            }));
+        }
+        if (usage.spend_control?.reached) {
+            wrap.add_child(new St.Label({
+                text: 'spend limit reached',
+                style_class: 'tokens-warn',
+            }));
+        }
 
         const now = Date.now();
-        const primaryResetMs = rl.primary?.resets_at ? rl.primary.resets_at * 1000 : null;
-        if (primaryResetMs && primaryResetMs < now) {
-            wrap.add_child(new St.Label({
-                text: 'snapshot stale — run `codex` to update',
-                style_class: 'tokens-warn',
-            }));
-        }
-        if (rl.rate_limit_reached_type) {
-            wrap.add_child(new St.Label({
-                text: `rate limit reached (${rl.rate_limit_reached_type})`,
-                style_class: 'tokens-warn',
-            }));
+        const rl = usage.rate_limit;
+        let rows = 0;
+        for (const w of [rl?.primary_window, rl?.secondary_window]) {
+            if (!w || w.used_percent == null) continue;
+            rows++;
+            wrap.add_child(makeWindowRow(
+                codexWindowLabel(w), w.used_percent, codexResetDate(w, now), now));
         }
 
-        const rows = [
-            [rl.primary,   '5 hours'],
-            [rl.secondary, 'Weekly'],
-        ];
-        for (const [w, label] of rows) {
-            if (!w) continue;
-            const reset = w.resets_at ? new Date(w.resets_at * 1000) : null;
-            wrap.add_child(makeWindowRow(label, w.used_percent, reset, now));
+        // Model-scoped extras (e.g. promotional model limits) reported alongside
+        // the account-wide windows; labeled by the server-provided limit_name.
+        for (const extra of usage.additional_rate_limits ?? []) {
+            const w = extra?.rate_limit?.primary_window;
+            if (!w || w.used_percent == null) continue;
+            rows++;
+            wrap.add_child(makeWindowRow(
+                extra.limit_name ?? 'Additional', w.used_percent, codexResetDate(w, now), now));
         }
 
-        // Last-turn context fill — distinct from rate-limit rows; label disambiguates.
-        const info = codex.info;
-        const lastTokens = info?.last_token_usage?.total_tokens;
-        const ctxWindow  = info?.model_context_window;
-        if (lastTokens != null && ctxWindow) {
-            const ctxPct = Math.min(100, lastTokens / ctxWindow * 100);
-            wrap.add_child(makeWindowRow('Context · last turn', ctxPct, null, now));
-            wrap.add_child(new St.Label({
-                text: `${fmtTokens(lastTokens)} / ${fmtTokens(ctxWindow)} tokens`,
-                style_class: 'tokens-extra',
-            }));
+        if (rows === 0) {
+            wrap.add_child(new St.Label({ text: 'no usage windows reported', style_class: 'tokens-empty' }));
         }
 
-        // Cumulative session totals — only emitted if the server sent the info block.
-        const tot = info?.total_token_usage;
-        if (tot?.total_tokens != null) {
-            const cachePct = tot.input_tokens
-                ? (tot.cached_input_tokens / tot.input_tokens * 100).toFixed(0)
-                : null;
-            const parts = [`Σ ${fmtTokens(tot.total_tokens)} tokens`];
-            if (cachePct != null) parts.push(`cache ${cachePct}%`);
-            if (tot.reasoning_output_tokens) {
-                parts.push(`reasoning ${fmtTokens(tot.reasoning_output_tokens)}`);
-            }
-            wrap.add_child(new St.Label({
-                text: parts.join(' · '),
-                style_class: 'tokens-extra',
-            }));
-        }
         addCustomItem(this._codexSection, wrap);
     }
 
